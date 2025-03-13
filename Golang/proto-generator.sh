@@ -1,122 +1,52 @@
-#!/bin/bash
+#!/bin/sh
+# Simple script to generate Protocol Buffer code for Kafka consumers
+# Usage: ./simple_proto_gen.sh <topic_name> <proto_repo_path> <output_repo_path>
 
-# Script to generate Protocol Buffer code for a specific Kafka topic
-# Usage: ./generate_proto.sh --topic <topic-name> --proto-repo <proto-repo-path> --output-repo <go-repo-path>
-
+# Exit on error
 set -e
 
-# Default values
-PROTO_REPO=""
-OUTPUT_REPO=""
-TOPIC=""
-BRANCH="main"
-MAPPER_FILE="audit_topic_mapper.json"
-FORCE_UPDATE=false
+# Check arguments
+if [ "$#" -lt 3 ]; then
+  echo "Usage: $0 <topic_name> <proto_repo_path> <output_repo_path>"
+  echo "Example: $0 my-topic ~/proto-repo ~/go-service"
+  exit 1
+fi
 
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-  key="$1"
-  case $key in
-    --topic)
-      TOPIC="$2"
-      shift 2
-      ;;
-    --proto-repo)
-      PROTO_REPO="$2"
-      shift 2
-      ;;
-    --output-repo)
-      OUTPUT_REPO="$2"
-      shift 2
-      ;;
-    --branch)
-      BRANCH="$2"
-      shift 2
-      ;;
-    --mapper-file)
-      MAPPER_FILE="$2"
-      shift 2
-      ;;
-    --force)
-      FORCE_UPDATE=true
-      shift
-      ;;
-    --help)
-      echo "Usage: ./generate_proto.sh --topic <topic-name> --proto-repo <proto-repo-path> --output-repo <go-repo-path> [--branch <branch-name>] [--mapper-file <mapper-file-path>] [--force]"
-      echo ""
-      echo "Options:"
-      echo "  --topic <topic-name>           Kafka topic name to generate code for"
-      echo "  --proto-repo <proto-repo-path> Path or URL to the proto repository"
-      echo "  --output-repo <go-repo-path>   Path to the Go microservice repository"
-      echo "  --branch <branch-name>         Git branch to use (default: main)"
-      echo "  --mapper-file <mapper-file>    Path to mapper file (default: audit_topic_mapper.json)"
-      echo "  --force                        Force update even if repo exists"
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: $1"
-      echo "Use --help for usage information"
-      exit 1
-      ;;
-  esac
+TOPIC="$1"
+PROTO_REPO="$2"
+OUTPUT_REPO="$3"
+MAPPER_FILE="audit_topic_mapper.json"
+
+echo "Starting proto code generation for topic: $TOPIC"
+echo "Proto repo: $PROTO_REPO"
+echo "Output repo: $OUTPUT_REPO"
+
+# Check if required tools are installed
+for cmd in jq protoc; do
+  if ! command -v $cmd >/dev/null 2>&1; then
+    echo "Error: $cmd is required but not installed"
+    exit 1
+  fi
 done
 
-# Validate required arguments
-if [ -z "$TOPIC" ]; then
-  echo "Error: Topic name is required (--topic)"
+# Check if the mapper file exists
+if [ ! -f "$PROTO_REPO/$MAPPER_FILE" ]; then
+  echo "Error: Mapper file not found at $PROTO_REPO/$MAPPER_FILE"
   exit 1
 fi
 
-if [ -z "$PROTO_REPO" ]; then
-  echo "Error: Proto repository path is required (--proto-repo)"
-  exit 1
-fi
-
-if [ -z "$OUTPUT_REPO" ]; then
-  echo "Error: Output repository path is required (--output-repo)"
-  exit 1
-fi
-
-# Create a temporary directory for the proto repo if it's a URL
-if [[ "$PROTO_REPO" == http* ]]; then
-  TEMP_DIR=$(mktemp -d)
-  REPO_URL="$PROTO_REPO"
-  PROTO_REPO="$TEMP_DIR"
-  
-  echo "Cloning $REPO_URL to $PROTO_REPO..."
-  git clone -b "$BRANCH" "$REPO_URL" "$PROTO_REPO"
-  
-  # Clean up on exit
-  trap "rm -rf $TEMP_DIR" EXIT
-fi
-
-# Set the output directory for generated Go files
+# Create output directories
 GENERATED_DIR="$OUTPUT_REPO/internal/proto/generated"
-mkdir -p "$GENERATED_DIR"
+KAFKA_DIR="$OUTPUT_REPO/internal/kafka"
+MODELS_DIR="$OUTPUT_REPO/internal/models"
+EXAMPLES_DIR="$OUTPUT_REPO/examples"
 
-# Read the topic mapper file
-MAPPER_PATH="$PROTO_REPO/$MAPPER_FILE"
-if [ ! -f "$MAPPER_PATH" ]; then
-  echo "Error: Mapper file not found at $MAPPER_PATH"
-  exit 1
-fi
+mkdir -p "$GENERATED_DIR" "$KAFKA_DIR" "$MODELS_DIR" "$EXAMPLES_DIR"
 
-echo "Reading topic mapping from $MAPPER_PATH..."
+# Extract message classes for the topic from the mapper file
+echo "Reading topic mapping from $PROTO_REPO/$MAPPER_FILE"
 
-# Parse the JSON to get message types for the specified topic
-# This adapts to the format:
-# {
-#   topic: "topic-name",
-#   tenantIds: [],
-#   messageTypes: [
-#     {
-#       publisherName: "publisher",
-#       className: "ProtoClassName",
-#       messageTypeId: "message-type-id"
-#     }
-#   ]
-# }
-MESSAGE_CLASSES=$(jq -r ".[] | select(.topic == \"$TOPIC\") | .messageTypes[] | .className" "$MAPPER_PATH")
+MESSAGE_CLASSES=$(jq -r ".[] | select(.topic == \"$TOPIC\") | .messageTypes[] | .className" "$PROTO_REPO/$MAPPER_FILE")
 
 if [ -z "$MESSAGE_CLASSES" ]; then
   echo "Error: No message classes found for topic '$TOPIC' in the mapper file"
@@ -125,123 +55,94 @@ fi
 
 echo "Found message classes for topic '$TOPIC': $MESSAGE_CLASSES"
 
-# Find all .proto files in the repo
-PROTO_FILES=$(find "$PROTO_REPO" -name "*.proto")
-
-# Create a temporary directory for the proto build process
+# Create a temporary build directory
 BUILD_DIR=$(mktemp -d)
-trap "rm -rf $BUILD_DIR" EXIT
+echo "Using temporary build directory: $BUILD_DIR"
+trap 'rm -rf "$BUILD_DIR"' EXIT
 
-echo "Analyzing proto dependencies..."
+# Find all proto files and their imports
+echo "Collecting proto files and dependencies..."
 
-# Function to find all imports in a proto file
-find_imports() {
-  local proto_file="$1"
-  grep -E '^import\s+"[^"]+";' "$proto_file" | sed 's/import\s\+"\([^"]\+\)".*/\1/'
-}
+# Create temp files to store proto paths
+PROTO_LIST=$(mktemp)
+IMPORT_LIST=$(mktemp)
+REQUIRED_LIST=$(mktemp)
+trap 'rm -rf "$BUILD_DIR" "$PROTO_LIST" "$IMPORT_LIST" "$REQUIRED_LIST"' EXIT
 
-# Function to find message types in a proto file
-find_message_types() {
-  local proto_file="$1"
-  grep -E '^message\s+[A-Za-z0-9_]+' "$proto_file" | sed 's/message\s\+\([A-Za-z0-9_]\+\).*/\1/'
-}
+# Find all proto files in the repo
+find "$PROTO_REPO" -name "*.proto" > "$PROTO_LIST"
 
-# Build a map of message types to proto files
-declare -A MESSAGE_TO_PROTO
-for proto_file in $PROTO_FILES; do
-  for message in $(find_message_types "$proto_file"); do
-    MESSAGE_TO_PROTO["$message"]="$proto_file"
-  done
-done
-
-# Function to collect all required proto files recursively
-REQUIRED_PROTOS_FILE=$(mktemp)
-trap "rm -f $REQUIRED_PROTOS_FILE $MESSAGE_MAP_FILE" EXIT
-
-collect_required_protos() {
-  local proto_file="$1"
+# For each message class, find the proto file
+for message_class in $MESSAGE_CLASSES; do
+  echo "Looking for message class: $message_class"
+  FOUND=0
   
-  # If we've already processed this file, skip it
-  if grep -q "^$proto_file$" "$REQUIRED_PROTOS_FILE"; then
-    return
-  fi
-  
-  # Mark this file as required
-  echo "$proto_file" >> "$REQUIRED_PROTOS_FILE"
-  
-  # Find all imports in this file
-  for import in $(find_imports "$proto_file"); do
-    # Find the actual file path for this import
-    for potential_file in $PROTO_FILES; do
-      if [[ "$potential_file" == *"$import" ]]; then
-        collect_required_protos "$potential_file"
-        break
-      fi
-    done
-  done
-}
-
-# Collect all required proto files for each message ID
-for message_id in $MESSAGE_IDS; do
-  proto_file="${MESSAGE_TO_PROTO["$message_id"]}"
-  if [ -n "$proto_file" ]; then
-    echo "Found proto file for $message_id: $proto_file"
-    collect_required_protos "$proto_file"
-  else
-    echo "Warning: Could not find proto file for message type $message_id"
-    # Try searching for the message in all proto files
-    for proto_file in $PROTO_FILES; do
-      if grep -q "message\s\+$message_id\s*{" "$proto_file"; then
-        echo "Found $message_id in $proto_file"
-        collect_required_protos "$proto_file"
-        break
-      fi
-    done
-  fi
-done
-
-# Print all required proto files
-echo "Required proto files:"
-while read -r proto_file; do
-  echo "  $proto_file"
-done < "$REQUIRED_PROTOS_FILE"
-
-# Find the common proto root directory
-PROTO_ROOT="$PROTO_REPO"
-while read -r proto_file; do
-  # Get the relative path of the proto file
-  rel_path="${proto_file#$PROTO_REPO/}"
-  
-  # Find the deepest common directory
-  while [ -n "$rel_path" ]; do
-    potential_root="$PROTO_REPO/${rel_path%/*}"
-    if [ -d "$potential_root" ]; then
-      # Check if all imports can be resolved from this root
-      all_imports_resolve=true
-      while read -r check_proto; do
-        for import in $(find_imports "$check_proto"); do
-          if [ ! -f "$potential_root/$import" ]; then
-            all_imports_resolve=false
-            break 2
-          fi
-        done
-      done < "$REQUIRED_PROTOS_FILE"
-      
-      if [ "$all_imports_resolve" = true ]; then
-        PROTO_ROOT="$potential_root"
-        break
-      fi
+  while read -r proto_file; do
+    if grep -q "message\s\+$message_class\s*{" "$proto_file"; then
+      echo "Found $message_class in $proto_file"
+      echo "$proto_file" >> "$REQUIRED_LIST"
+      FOUND=1
+      break
     fi
-    # Move up one directory
-    rel_path="${rel_path%/*}"
+  done < "$PROTO_LIST"
+  
+  if [ "$FOUND" -eq 0 ]; then
+    echo "Warning: Could not find proto file for message type $message_class"
+  fi
+done
+
+# Process imports recursively
+process_imports() {
+  while read -r proto_file; do
+    # Extract imports from the proto file
+    grep -E '^import\s+"[^"]+";' "$proto_file" | sed 's/import\s\+"\([^"]\+\)".*/\1/' > "$IMPORT_LIST"
+    
+    # For each import, find the actual file
+    while read -r import_path; do
+      if [ -n "$import_path" ]; then
+        # Find the actual proto file for this import
+        while read -r potential_file; do
+          if echo "$potential_file" | grep -q "$import_path\$"; then
+            # Check if it's already in the required list
+            if ! grep -q "^$potential_file\$" "$REQUIRED_LIST"; then
+              echo "$potential_file" >> "$REQUIRED_LIST"
+              # Process imports from this file as well
+              process_imports_for_file "$potential_file"
+            fi
+            break
+          fi
+        done < "$PROTO_LIST"
+      fi
+    done < "$IMPORT_LIST"
   done
-done < "$REQUIRED_PROTOS_FILE"
+}
 
-echo "Using proto root directory: $PROTO_ROOT"
+# Helper function to process imports for a single file
+process_imports_for_file() {
+  local single_file="$1"
+  echo "$single_file" > "$IMPORT_LIST.tmp"
+  mv "$IMPORT_LIST.tmp" "$IMPORT_LIST"
+  process_imports
+}
 
-# Copy all required proto files to the build directory
+# Start processing imports
+cp "$REQUIRED_LIST" "$IMPORT_LIST"
+process_imports
+
+echo "Required proto files:"
+cat "$REQUIRED_LIST"
+
+# Try to determine the proto root directory
+echo "Determining proto root directory..."
+
+PROTO_ROOT="$PROTO_REPO"
+echo "Using proto root: $PROTO_ROOT"
+
+# Copy required proto files to build directory
+echo "Copying proto files to build directory..."
+
 while read -r proto_file; do
-  # Get relative path from PROTO_ROOT
+  # Get relative path from proto root
   rel_path="${proto_file#$PROTO_ROOT/}"
   
   # Create directory structure in build directory
@@ -249,46 +150,47 @@ while read -r proto_file; do
   
   # Copy the file
   cp "$proto_file" "$BUILD_DIR/$(dirname "$rel_path")/"
-done < "$REQUIRED_PROTOS_FILE"
+done < "$REQUIRED_LIST"
 
-# Run protoc to generate the Go code
-echo "Generating Go code..."
-find "$BUILD_DIR" -name "*.proto" -print0 | xargs -0 protoc \
+# Run protoc to generate Go code
+echo "Generating Go code with protoc..."
+
+find "$BUILD_DIR" -name "*.proto" | xargs protoc \
   --proto_path="$BUILD_DIR" \
   --go_out="$GENERATED_DIR" \
   --go_opt=paths=source_relative
 
-# Check if we need to generate gRPC code
-if grep -q "service\s\+[A-Za-z0-9_]\+" $(find "$BUILD_DIR" -name "*.proto"); then
+# Check if we should generate gRPC code
+if find "$BUILD_DIR" -name "*.proto" -exec grep -l "service\s\+[A-Za-z0-9_]\+" {} \; | grep -q .; then
   echo "Found service definitions, generating gRPC code..."
-  find "$BUILD_DIR" -name "*.proto" -print0 | xargs -0 protoc \
+  find "$BUILD_DIR" -name "*.proto" | xargs protoc \
     --proto_path="$BUILD_DIR" \
     --go-grpc_out="$GENERATED_DIR" \
     --go-grpc_opt=paths=source_relative
 fi
 
-# Generate a message processor for the specified topic
-KAFKA_DIR="$OUTPUT_REPO/internal/kafka"
-MODELS_DIR="$OUTPUT_REPO/internal/models"
-mkdir -p "$KAFKA_DIR" "$MODELS_DIR"
+# Generate models file
+echo "Generating models.go..."
 
-echo "Generating message processor components..."
-
-# First, create a models file with message type definitions
 cat > "$MODELS_DIR/messages.go" << EOF
 // Code generated for topic $TOPIC - DO NOT EDIT.
 package models
 
 import (
 	// Update this import path to match your project structure
-	"$(go list -m)$(echo $GENERATED_DIR | sed "s|$OUTPUT_REPO||")"
+	"$(go list -m 2>/dev/null || echo "github.com/yourusername/myservice")$(echo $GENERATED_DIR | sed "s|$OUTPUT_REPO||")"
 )
 
 // MessageHandler defines the interface for handling different message types
 type MessageHandler interface {
-$(for message_class in $MESSAGE_CLASSES; do
-  echo "	Handle${message_class}(*generated.${message_class}) error"
-done)
+EOF
+
+# Add message handler methods
+for message_class in $MESSAGE_CLASSES; do
+  echo "	Handle${message_class}(*generated.${message_class}) error" >> "$MODELS_DIR/messages.go"
+done
+
+cat >> "$MODELS_DIR/messages.go" << EOF
 }
 
 // TopicConfig defines configuration for a Kafka topic
@@ -306,7 +208,9 @@ type MessageTypeInfo struct {
 }
 EOF
 
-# Now create a message processor that can handle multiple topics
+# Generate message processor
+echo "Generating message_processor.go..."
+
 cat > "$KAFKA_DIR/message_processor.go" << EOF
 // Code generated - DO NOT EDIT.
 package kafka
@@ -318,8 +222,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	
 	// Update these import paths to match your project structure
-	"$(go list -m)/internal/models"
-	"$(go list -m)$(echo $GENERATED_DIR | sed "s|$OUTPUT_REPO||")"
+	"$(go list -m 2>/dev/null || echo "github.com/yourusername/myservice")/internal/models"
+	"$(go list -m 2>/dev/null || echo "github.com/yourusername/myservice")$(echo $GENERATED_DIR | sed "s|$OUTPUT_REPO||")"
 )
 
 // MessageProcessor processes messages from Kafka topics
@@ -359,62 +263,32 @@ func (p *MessageProcessor) ProcessMessage(topic string, data []byte) error {
 	
 	for _, msgType := range messageTypes {
 		switch msgType.ClassName {
-$(for message_class in $MESSAGE_CLASSES; do
-  echo "		case \"${message_class}\":
+EOF
+
+# Add message type cases
+for message_class in $MESSAGE_CLASSES; do
+  cat >> "$KAFKA_DIR/message_processor.go" << EOF
+		case "${message_class}":
 			var msg generated.${message_class}
 			if err := proto.Unmarshal(data, &msg); err != nil {
 				// Try next message type
 				continue
 			}
-			return p.handler.Handle${message_class}(&msg)"
-done)
+			return p.handler.Handle${message_class}(&msg)
+EOF
+done
+
+cat >> "$KAFKA_DIR/message_processor.go" << EOF
 		}
 	}
-	
-	/* Alternative approach if you have a wrapper message
-	var wrapper generated.MessageWrapper
-	if err := proto.Unmarshal(data, &wrapper); err != nil {
-		return fmt.Errorf("failed to unmarshal message wrapper: %w", err)
-	}
-	
-	// Process based on which oneof field is set
-$(for message_class in $MESSAGE_CLASSES; do
-  echo "	if msg := wrapper.Get${message_class}(); msg != nil {
-		return p.handler.Handle${message_class}(msg)
-	}"
-done)
-	*/
-	
-	/* Alternative approach if you have a header with message type ID
-	var header generated.Header
-	if err := proto.Unmarshal(data, &header); err != nil {
-		return fmt.Errorf("failed to unmarshal header: %w", err)
-	}
-	
-	// Find message type matching the ID
-	for _, msgType := range messageTypes {
-		if msgType.MessageTypeID == header.GetMessageType() {
-			switch msgType.ClassName {
-$(for message_class in $MESSAGE_CLASSES; do
-  echo "			case \"${message_class}\":
-				var msg generated.${message_class}
-				if err := proto.Unmarshal(data, &msg); err != nil {
-					return fmt.Errorf(\"failed to unmarshal %s: %w\", msgType.ClassName, err)
-				}
-				return p.handler.Handle${message_class}(&msg)"
-done)
-			}
-		}
-	}
-	
-	return fmt.Errorf("unknown message type: %s", header.GetMessageType())
-	*/
 	
 	return fmt.Errorf("failed to process message: no matching message type found")
 }
 EOF
 
-# Create a consumer manager that can handle multiple topics
+# Generate consumer manager
+echo "Generating consumer.go..."
+
 cat > "$KAFKA_DIR/consumer.go" << EOF
 // Code generated - DO NOT EDIT.
 package kafka
@@ -429,7 +303,7 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	
 	// Update this import path to match your project structure
-	"$(go list -m)/internal/models"
+	"$(go list -m 2>/dev/null || echo "github.com/yourusername/myservice")/internal/models"
 )
 
 // MessageChannel is a channel for Kafka messages
@@ -604,9 +478,10 @@ func (c *Consumer) processMessageChannel(ctx context.Context, topic string, mess
 }
 EOF
 
-# Generate a simple example of how to use the message processor
-mkdir -p "$OUTPUT_REPO/examples"
-cat > "$OUTPUT_REPO/examples/kafka_consumer_example.go" << EOF
+# Generate example usage
+echo "Generating example usage..."
+
+cat > "$EXAMPLES_DIR/kafka_consumer_example.go" << EOF
 // Example usage of the Kafka consumer
 package main
 
@@ -620,9 +495,9 @@ import (
 	"syscall"
 
 	// Update these import paths to match your project structure
-	"$(go list -m)/internal/kafka"
-	"$(go list -m)/internal/models"
-	"$(go list -m)$(echo $GENERATED_DIR | sed "s|$OUTPUT_REPO||")"
+	"$(go list -m 2>/dev/null || echo "github.com/yourusername/myservice")/internal/kafka"
+	"$(go list -m 2>/dev/null || echo "github.com/yourusername/myservice")/internal/models"
+	"$(go list -m 2>/dev/null || echo "github.com/yourusername/myservice")$(echo $GENERATED_DIR | sed "s|$OUTPUT_REPO||")"
 )
 
 // TopicMapping represents a mapping between a Kafka topic and message types
@@ -637,14 +512,21 @@ type MessageHandlerImpl struct {
 	// Add any dependencies your handler needs
 }
 
-$(for message_class in $MESSAGE_CLASSES; do
-echo "// Handle${message_class} processes ${message_class} messages
+EOF
+
+# Add message handler implementations
+for message_class in $MESSAGE_CLASSES; do
+  cat >> "$EXAMPLES_DIR/kafka_consumer_example.go" << EOF
+// Handle${message_class} processes ${message_class} messages
 func (h *MessageHandlerImpl) Handle${message_class}(msg *generated.${message_class}) error {
-	log.Printf(\"Received ${message_class} message\")
+	log.Printf("Received ${message_class} message")
 	// Implement your message handling logic here
 	return nil
-}"
-done)
+}
+EOF
+done
+
+cat >> "$EXAMPLES_DIR/kafka_consumer_example.go" << EOF
 
 func main() {
 	// Create the message handler
@@ -673,12 +555,10 @@ func main() {
 		log.Fatalf("Failed to load topic mappings: %v", err)
 	}
 
-	// Create the message processor
-	processor := kafka.NewMessageProcessor(handler)
-
 	// Register topics and start consumers
 	for _, mapping := range topicMappings {
 		// Register the topic with the processor
+		processor := consumer.processor
 		processor.RegisterTopic(mapping.Topic, mapping.MessageTypes)
 
 		// Add the topic to the consumer
@@ -731,7 +611,7 @@ echo "  - Protocol Buffer Go code: $GENERATED_DIR/*.go"
 echo "  - Message Processor: $KAFKA_DIR/message_processor.go"
 echo "  - Consumer Manager: $KAFKA_DIR/consumer.go"
 echo "  - Message Models: $MODELS_DIR/messages.go"
-echo "  - Usage Example: $OUTPUT_REPO/examples/kafka_consumer_example.go"
+echo "  - Usage Example: $EXAMPLES_DIR/kafka_consumer_example.go"
 echo ""
 echo "Next steps:"
 echo "  1. Review the generated components and customize as needed"
