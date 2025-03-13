@@ -155,17 +155,19 @@ for proto_file in $PROTO_FILES; do
 done
 
 # Function to collect all required proto files recursively
-declare -A REQUIRED_PROTOS
+REQUIRED_PROTOS_FILE=$(mktemp)
+trap "rm -f $REQUIRED_PROTOS_FILE $MESSAGE_MAP_FILE" EXIT
+
 collect_required_protos() {
   local proto_file="$1"
   
   # If we've already processed this file, skip it
-  if [ -n "${REQUIRED_PROTOS["$proto_file"]}" ]; then
+  if grep -q "^$proto_file$" "$REQUIRED_PROTOS_FILE"; then
     return
   fi
   
   # Mark this file as required
-  REQUIRED_PROTOS["$proto_file"]=1
+  echo "$proto_file" >> "$REQUIRED_PROTOS_FILE"
   
   # Find all imports in this file
   for import in $(find_imports "$proto_file"); do
@@ -200,13 +202,13 @@ done
 
 # Print all required proto files
 echo "Required proto files:"
-for proto_file in "${!REQUIRED_PROTOS[@]}"; do
+while read -r proto_file; do
   echo "  $proto_file"
-done
+done < "$REQUIRED_PROTOS_FILE"
 
 # Find the common proto root directory
 PROTO_ROOT="$PROTO_REPO"
-for proto_file in "${!REQUIRED_PROTOS[@]}"; do
+while read -r proto_file; do
   # Get the relative path of the proto file
   rel_path="${proto_file#$PROTO_REPO/}"
   
@@ -216,14 +218,14 @@ for proto_file in "${!REQUIRED_PROTOS[@]}"; do
     if [ -d "$potential_root" ]; then
       # Check if all imports can be resolved from this root
       all_imports_resolve=true
-      for proto in "${!REQUIRED_PROTOS[@]}"; do
-        for import in $(find_imports "$proto"); do
+      while read -r check_proto; do
+        for import in $(find_imports "$check_proto"); do
           if [ ! -f "$potential_root/$import" ]; then
             all_imports_resolve=false
             break 2
           fi
         done
-      done
+      done < "$REQUIRED_PROTOS_FILE"
       
       if [ "$all_imports_resolve" = true ]; then
         PROTO_ROOT="$potential_root"
@@ -233,12 +235,12 @@ for proto_file in "${!REQUIRED_PROTOS[@]}"; do
     # Move up one directory
     rel_path="${rel_path%/*}"
   done
-done
+done < "$REQUIRED_PROTOS_FILE"
 
 echo "Using proto root directory: $PROTO_ROOT"
 
 # Copy all required proto files to the build directory
-for proto_file in "${!REQUIRED_PROTOS[@]}"; do
+while read -r proto_file; do
   # Get relative path from PROTO_ROOT
   rel_path="${proto_file#$PROTO_ROOT/}"
   
@@ -247,7 +249,7 @@ for proto_file in "${!REQUIRED_PROTOS[@]}"; do
   
   # Copy the file
   cp "$proto_file" "$BUILD_DIR/$(dirname "$rel_path")/"
-done
+done < "$REQUIRED_PROTOS_FILE"
 
 # Run protoc to generate the Go code
 echo "Generating Go code..."
